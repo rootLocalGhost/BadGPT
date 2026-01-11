@@ -1,0 +1,16 @@
+# Core AI & Math
+numpy
+pandas
+tiktoken
+
+# PDF & OCR Tools
+pdfplumber
+pypdf
+pytesseract
+pdf2image
+Pillow
+
+# Interface & Utils
+gradio
+tqdm
+matplotlib
