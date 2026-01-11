@@ -2,27 +2,29 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-BLOCK_SIZE = 256
-N_EMBD = 384
-N_HEAD = 6
-N_LAYER = 6
-DROPOUT = 0.0
-VOCAB_SIZE = 100277
-
 try:
     import intel_extension_for_pytorch as ipex
     DEVICE = 'xpu'
 except ImportError:
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+class GPTConfig:
+    def __init__(self, block_size=256, n_embd=384, n_head=6, n_layer=6, dropout=0.0, vocab_size=100277):
+        self.block_size = block_size
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.n_layer = n_layer
+        self.dropout = dropout
+        self.vocab_size = vocab_size
+
 class Head(nn.Module):
-    def __init__(self, head_size):
+    def __init__(self, config, head_size):
         super().__init__()
-        self.key = nn.Linear(N_EMBD, head_size, bias=False)
-        self.query = nn.Linear(N_EMBD, head_size, bias=False)
-        self.value = nn.Linear(N_EMBD, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
-        self.dropout = nn.Dropout(DROPOUT)
+        self.key = nn.Linear(config.n_embd, head_size, bias=False)
+        self.query = nn.Linear(config.n_embd, head_size, bias=False)
+        self.value = nn.Linear(config.n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(config.block_size, config.block_size)))
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -37,11 +39,11 @@ class Head(nn.Module):
         return out
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads, head_size):
+    def __init__(self, config, head_size):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(num_heads * head_size, N_EMBD)
-        self.dropout = nn.Dropout(DROPOUT)
+        self.heads = nn.ModuleList([Head(config, head_size) for _ in range(config.n_head)])
+        self.proj = nn.Linear(config.n_head * head_size, config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
@@ -49,26 +51,26 @@ class MultiHeadAttention(nn.Module):
         return out
 
 class FeedForward(nn.Module):
-    def __init__(self, n_embd):
+    def __init__(self, config):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
+            nn.Linear(config.n_embd, 4 * config.n_embd),
             nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(DROPOUT),
+            nn.Linear(4 * config.n_embd, config.n_embd),
+            nn.Dropout(config.dropout),
         )
 
     def forward(self, x):
         return self.net(x)
 
 class Block(nn.Module):
-    def __init__(self, n_embd, n_head):
+    def __init__(self, config):
         super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedForward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
+        head_size = config.n_embd // config.n_head
+        self.sa = MultiHeadAttention(config, head_size)
+        self.ffwd = FeedForward(config)
+        self.ln1 = nn.LayerNorm(config.n_embd)
+        self.ln2 = nn.LayerNorm(config.n_embd)
 
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
@@ -76,13 +78,14 @@ class Block(nn.Module):
         return x
 
 class GPTModel(nn.Module):
-    def __init__(self):
+    def __init__(self, config=GPTConfig()):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(VOCAB_SIZE, N_EMBD)
-        self.position_embedding_table = nn.Embedding(BLOCK_SIZE, N_EMBD)
-        self.blocks = nn.Sequential(*[Block(N_EMBD, n_head=N_HEAD) for _ in range(N_LAYER)])
-        self.ln_f = nn.LayerNorm(N_EMBD)
-        self.lm_head = nn.Linear(N_EMBD, VOCAB_SIZE, bias=False)
+        self.config = config
+        self.token_embedding_table = nn.Embedding(config.vocab_size, config.n_embd)
+        self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
+        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.token_embedding_table.weight = self.lm_head.weight
 
     def forward(self, idx, targets=None):
@@ -104,7 +107,7 @@ class GPTModel(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0):
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= BLOCK_SIZE else idx[:, -BLOCK_SIZE:]
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / (temperature + 1e-9)
             probs = F.softmax(logits, dim=-1)

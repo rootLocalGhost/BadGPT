@@ -2,7 +2,7 @@ import torch
 import tiktoken
 import os
 import glob
-from architecture import GPTModel, DEVICE, BLOCK_SIZE
+from architecture import GPTModel, GPTConfig, DEVICE
 
 enc = tiktoken.get_encoding("cl100k_base")
 
@@ -14,8 +14,21 @@ def load_model_weights(weights_dir="model/weights"):
     latest_file = max(files, key=os.path.getmtime)
     print(f"🧠 Loading Inference Weights: {latest_file}")
     
-    model = GPTModel().to(DEVICE)
-    model.load_state_dict(torch.load(latest_file, map_location=DEVICE))
+    payload = torch.load(latest_file, map_location=DEVICE)
+    
+    # Handle both old format (state_dict only) and new format (dict with config)
+    if 'config' in payload and payload['config'] is not None:
+        cfg_dict = payload['config']
+        config = GPTConfig(**cfg_dict)
+        state_dict = payload['model_state']
+    else:
+        # Fallback to default architecture if config missing
+        print("⚠️ Config not found in weights. Using default architecture.")
+        config = GPTConfig() 
+        state_dict = payload if 'model_state' not in payload else payload['model_state']
+
+    model = GPTModel(config).to(DEVICE)
+    model.load_state_dict(state_dict)
     model.eval()
     
     return model, f"✅ Loaded: {os.path.basename(latest_file)}"

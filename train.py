@@ -5,14 +5,10 @@ import time
 import pandas as pd
 import gc
 import glob
-from architecture import GPTModel, DEVICE, BLOCK_SIZE, N_EMBD
+from architecture import GPTModel, GPTConfig, DEVICE
 
-BATCH_SIZE = 8
-GRAD_ACCUM_STEPS = 8
-INITIAL_LR = 1e-3
 CHECKPOINT_DIR = "model/checkpoints"
 DATA_DIR = "data/token"
-
 enc = tiktoken.get_encoding("cl100k_base")
 
 def load_dataset():
@@ -29,9 +25,17 @@ def load_dataset():
     data = torch.tensor(enc.encode(full_text), dtype=torch.long)
     return data, f"✅ Loaded {len(data)} tokens from {len(files)} files."
 
-def train_generator(steps_to_add, autosave_freq):
+def train_generator(steps_to_add, autosave_freq, 
+                    batch_size, grad_accum, lr, 
+                    block_size, n_embd, n_head, n_layer, dropout):
+    
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
+    # Validation
+    if n_embd % n_head != 0:
+        yield f"❌ Error: N_EMBD ({n_embd}) must be divisible by N_HEAD ({n_head}).", None, None
+        return
+
     if DEVICE == 'xpu': torch.xpu.empty_cache()
     gc.collect()
     
@@ -40,8 +44,17 @@ def train_generator(steps_to_add, autosave_freq):
         yield msg, None, None
         return
 
-    model = GPTModel().to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=INITIAL_LR)
+    # Configuration
+    config = GPTConfig(
+        block_size=int(block_size),
+        n_embd=int(n_embd),
+        n_head=int(n_head),
+        n_layer=int(n_layer),
+        dropout=float(dropout)
+    )
+
+    model = GPTModel(config).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50)
     
     ckpts = glob.glob(f"{CHECKPOINT_DIR}/*.pt")
@@ -49,18 +62,32 @@ def train_generator(steps_to_add, autosave_freq):
     loss_history = []
     lr_history = []
     
+    # Checkpoint Loading Strategy
+    # We only load if the architecture matches or we force restart. 
+    # For this simplified GUI, if parameters change significantly from saved model, 
+    # standard PyTorch load_state_dict might fail. We wrap in try/except.
+    
     if ckpts:
         latest = max(ckpts, key=os.path.getmtime)
         try:
             checkpoint = torch.load(latest, map_location=DEVICE)
+            
+            # Check if config exists in checkpoint and matches current request
+            ckpt_config = checkpoint.get('config', None)
+            
+            # Simple check: If we manually changed params in GUI, we might prefer starting fresh
+            # or we try to load. Here we try to load.
             model.load_state_dict(checkpoint['model_state'])
             optimizer.load_state_dict(checkpoint['optimizer_state'])
             start_step = checkpoint.get('total_steps', 0)
             loss_history = checkpoint.get('loss_history', [])
             lr_history = checkpoint.get('lr_history', [])
+            
             yield f"♻️ Resumed from {latest}", pd.DataFrame(loss_history, columns=["Step", "Loss"]), pd.DataFrame(lr_history, columns=["Step", "LR"])
         except Exception as e:
-            yield f"⚠️ Corrupt checkpoint {latest}, starting fresh. ({e})", None, None
+            yield f"⚠️ Checkpoint mismatch or corrupt ({e}). Starting fresh with new architecture.", None, None
+            # If load fails (e.g. architecture change), we just continue with the new initialized model
+            start_step = 0
 
     if DEVICE == 'xpu':
         import intel_extension_for_pytorch as ipex
@@ -77,28 +104,31 @@ def train_generator(steps_to_add, autosave_freq):
     df_lr = None
 
     for i in range(start_step, target_step):
-        ix = torch.randint(len(train_data) - BLOCK_SIZE, (BATCH_SIZE,))
-        x = torch.stack([train_data[k:k+BLOCK_SIZE] for k in ix]).to(DEVICE)
-        y = torch.stack([train_data[k+1:k+BLOCK_SIZE+1] for k in ix]).to(DEVICE)
+        # Data sampling
+        ix = torch.randint(len(train_data) - config.block_size, (int(batch_size),))
+        x = torch.stack([train_data[k:k+config.block_size] for k in ix]).to(DEVICE)
+        y = torch.stack([train_data[k+1:k+config.block_size+1] for k in ix]).to(DEVICE)
         
         logits, loss = model(x, y)
-        loss = loss / GRAD_ACCUM_STEPS
+        loss = loss / int(grad_accum)
         loss.backward()
         
-        if (i + 1) % GRAD_ACCUM_STEPS == 0:
+        if (i + 1) % int(grad_accum) == 0:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             if DEVICE == 'xpu': torch.xpu.synchronize()
             
-            current_loss = loss.item() * GRAD_ACCUM_STEPS
+            current_loss = loss.item() * int(grad_accum)
             scheduler.step(current_loss)
             current_lr = optimizer.param_groups[0]['lr']
             
-            # UI Update (Every 5 steps)
             if (i + 1) % 5 == 0:
                 dt = time.time() - t0
                 t0 = time.time()
-                speed = (BATCH_SIZE * GRAD_ACCUM_STEPS * BLOCK_SIZE) / (dt + 1e-9)
+                # Tokens per second calculation
+                tokens_processed = int(batch_size) * int(grad_accum) * config.block_size
+                speed = tokens_processed / (dt + 1e-9)
+                
                 loss_history.append([i+1, current_loss])
                 lr_history.append([i+1, current_lr])
                 
@@ -108,15 +138,22 @@ def train_generator(steps_to_add, autosave_freq):
                 log_msg = f"Step {i+1} | Loss: {current_loss:.4f} | LR: {current_lr:.6f} | {speed:.0f} tok/s"
                 yield log_msg, df_loss, df_lr
         
-        # Save Checkpoint Logic: Autosave freq OR Final Step
-        if (i + 1) % autosave_freq == 0 or (i + 1) == target_step:
+        if (i + 1) % int(autosave_freq) == 0 or (i + 1) == target_step:
             ckpt_path = f"{CHECKPOINT_DIR}/ckpt_step_{i+1}.pt"
             torch.save({
                 'model_state': model.state_dict(),
                 'optimizer_state': optimizer.state_dict(),
                 'loss_history': loss_history,
                 'lr_history': lr_history,
-                'total_steps': i+1
+                'total_steps': i+1,
+                'config': {
+                    'block_size': config.block_size,
+                    'n_embd': config.n_embd,
+                    'n_head': config.n_head,
+                    'n_layer': config.n_layer,
+                    'dropout': config.dropout,
+                    'vocab_size': config.vocab_size
+                }
             }, ckpt_path)
             yield f"💾 Saved Checkpoint: {ckpt_path}", df_loss, df_lr
                 
