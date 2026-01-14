@@ -1,7 +1,6 @@
 import torch
 import os
 import glob
-import sys
 
 CHECKPOINT_DIR = "model/checkpoints"
 WEIGHTS_DIR = "model/weights"
@@ -10,29 +9,20 @@ os.makedirs(WEIGHTS_DIR, exist_ok=True)
 def convert():
     files = glob.glob(f"{CHECKPOINT_DIR}/*.pt")
     if not files:
-        print("❌ No checkpoints found.")
+        print("❌ No checkpoints.")
         return
-
-    latest_ckpt = max(files, key=os.path.getmtime)
-    print(f"🔧 Converting {latest_ckpt}...")
-    
-    checkpoint = torch.load(latest_ckpt, map_location='cpu') 
-    
-    # We need to save both weights AND the config so inference knows the shape
+    latest = max(files, key=os.path.getmtime)
+    ckpt = torch.load(latest, map_location='cpu')
     save_payload = {
-        'model_state': checkpoint['model_state'],
-        'config': checkpoint.get('config', None) # Legacy support: might be None
+        'model_state': ckpt['model_state'],
+        'config': ckpt.get('config', None)
     }
-    
-    step_num = checkpoint.get('total_steps', 'unknown')
-    
-    output_name = f"badgpt_v1_step{step_num}.pth"
-    output_path = os.path.join(WEIGHTS_DIR, output_name)
-    
-    torch.save(save_payload, output_path)
-    
-    print(f"✅ Success! Saved Lite Weights to: {output_path}")
-    print(f"📉 Size reduced from {os.path.getsize(latest_ckpt)/1024**2:.1f}MB to {os.path.getsize(output_path)/1024**2:.1f}MB")
+    step = ckpt.get('total_steps', 'unknown')
+    mode = ckpt.get('config', {}).get('model_mode', 'scratch')
+    out_name = f"badgpt_{mode}_step{step}.pth"
+    out_path = os.path.join(WEIGHTS_DIR, out_name)
+    torch.save(save_payload, out_path)
+    print(f"✅ Exported to {out_path}")
 
 if __name__ == "__main__":
     convert()
